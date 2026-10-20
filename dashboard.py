@@ -10,6 +10,8 @@ import cv2
 import pandas as pd
 import streamlit as st
 from ultralytics import YOLO
+from streamlit_webrtc import VideoProcessorBase, webrtc_streamer, RTCConfiguration
+import av
 
 
 # =========================================================
@@ -797,329 +799,98 @@ elif page == "Video Analysis":
                     input_path.unlink(missing_ok=True)
 
 # =========================================================
-# LIVE WEBCAM / USB CAMERA / CCTV MONITORING
+# LIVE WEBCAM MONITORING (BROWSER CAMERA VIA WEBRTC)
 # =========================================================
 
 elif page == "Live Webcam Monitoring":
 
     st.markdown('<div class="section-kicker">Live operations</div>', unsafe_allow_html=True)
     st.subheader("Live camera monitoring")
-    st.markdown('<div class="section-note">Run a bounded monitoring session and review the resulting safety detections.</div>', unsafe_allow_html=True)
-    st.write(
-        "Monitor live frames with person tracking and PPE detection. "
-        "For local testing, start with your laptop's built-in webcam."
-    )
-
-    source_value = None
-    camera_type = st.selectbox(
-        "Choose camera source",
-        ["Laptop webcam", "External USB webcam", "CCTV / RTSP stream"],
-        key="manual_live_camera_type",
-    )
-    if camera_type == "Laptop webcam":
-        source_value = 0
-        st.caption("Uses the default webcam connected to the computer running Streamlit.")
-    elif camera_type == "External USB webcam":
-        source_value = int(st.selectbox("USB camera index", [1, 2, 3], index=0, key="manual_live_usb"))
-        st.caption("If your USB camera does not open, try another index (1, 2, or 3).")
-    else:
-        rtsp_url = st.text_input(
-            "CCTV RTSP URL",
-            placeholder="rtsp://camera-ip:554/stream1",
-            help="Enter the RTSP stream URL supplied by your CCTV/NVR. Keep credentials private.",
-            key="manual_live_rtsp",
-        )
-        source_value = rtsp_url.strip() if rtsp_url.strip() else None
+    st.markdown('<div class="section-note">Use this page from a browser to grant access to the webcam on the device you are using.</div>', unsafe_allow_html=True)
+    st.write("The browser sends camera frames to this Streamlit app using WebRTC. The YOLO models process the frames on the Render server.")
 
     live_confidence = st.slider(
-        "Live detection confidence threshold",
-        min_value=0.10,
-        max_value=0.90,
-        value=0.35,
-        step=0.05,
-        key="live_confidence",
+        "Detection confidence threshold", min_value=0.10, max_value=0.90,
+        value=0.35, step=0.05, key="browser_live_confidence"
     )
     live_width = st.select_slider(
-        "Live processing width",
-        options=[480, 640, 800, 960],
-        value=640,
-        key="live_width",
-    )
-    enable_sound_alert = st.checkbox("Enable audible safety alarm", value=True, key="enable_sound_alert")
-    alert_cooldown_seconds = st.slider(
-        "Audible alert cooldown (seconds)", min_value=2, max_value=15, value=5, step=1,
-        help="Limits repeated beeps while a warning remains active.", key="alert_cooldown_seconds"
+        "Live processing width", options=[320, 480, 640, 800],
+        value=480, key="browser_live_width"
     )
 
-    duration_seconds = st.slider(
-        "Monitoring duration (seconds)",
-        min_value=10,
-        max_value=120,
-        value=30,
-        step=10,
-        help="This run processes the camera for a fixed duration, then releases the camera.",
-    )
+    st.info("Open this page using HTTPS in Chrome or Edge, click START, and allow camera permission when your browser asks. The first frame may take longer while the models load.")
 
-    st.warning(
-        "Camera monitoring runs on the machine hosting this Python app. "
-        "When deployed remotely, camera index 0 refers to the server's camera, "
-        "not automatically your laptop webcam. Browser-camera access requires a separate integration."
-    )
+    class BrowserPPEProcessor(VideoProcessorBase):
+        def __init__(self):
+            self.frame_count = 0
+            self.last_error = None
 
-    start_live = st.button("▶️ Start Live Monitoring", type="primary", key="start_live_monitoring")
+        def recv(self, frame):
+            image = frame.to_ndarray(format="bgr24")
+            self.frame_count += 1
+            h, w = image.shape[:2]
+            scale = min(1.0, float(live_width) / max(w, 1))
+            if scale < 1.0:
+                image = cv2.resize(image, (max(1, int(w * scale)), max(1, int(h * scale))))
 
-    if start_live:
-        if source_value is None:
-            st.error("Please enter a valid CCTV RTSP URL.")
-        else:
-            camera = None
+            annotated = image.copy()
             try:
-                with st.spinner("Loading AI models..."):
-                    person_model = load_person_model()
-                    ppe_model = load_ppe_model()
+                person_model = load_person_model()
+                ppe_model = load_ppe_model()
+                person_results = person_model.predict(image, classes=[0], conf=live_confidence, verbose=False)
+                ppe_results = ppe_model.predict(image, conf=live_confidence, verbose=False)
+                people = []
+                for result in person_results:
+                    if result.boxes is None:
+                        continue
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                        people.append({"box": (int(x1), int(y1), int(x2), int(y2)), "track_id": None})
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 200, 0), 2)
+                        cv2.putText(annotated, "Person", (x1, max(22, y1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 200, 0), 2)
 
-                # CAP_FFMPEG can help with RTSP; OpenCV chooses the backend for local cameras.
-                if isinstance(source_value, str):
-                    camera = cv2.VideoCapture(source_value, cv2.CAP_FFMPEG)
-                else:
-                    camera = cv2.VideoCapture(source_value, cv2.CAP_DSHOW if hasattr(cv2, "CAP_DSHOW") else 0)
+                violations = 0
+                for result in ppe_results:
+                    if result.boxes is None:
+                        continue
+                    names = result.names
+                    for box in result.boxes:
+                        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
+                        class_id = int(box.cls[0].item())
+                        class_name = str(names.get(class_id, class_id))
+                        score = float(box.conf[0].item())
+                        missing = is_missing_ppe(class_name)
+                        color = (0, 0, 255) if missing else (0, 165, 255)
+                        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+                        cv2.putText(annotated, f"{class_name} {score:.2f}", (x1, max(22, y1 - 7)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2)
+                        if missing:
+                            violations += 1
 
-                if not camera.isOpened():
-                    raise RuntimeError(
-                        "Could not open this camera source. Check camera permissions, "
-                        "the USB index, or the CCTV RTSP URL."
-                    )
+                if violations:
+                    ah, aw = annotated.shape[:2]
+                    cv2.rectangle(annotated, (3, 3), (aw - 4, ah - 4), (0, 0, 255), 7)
+                    cv2.rectangle(annotated, (0, 0), (aw, min(42, ah)), (0, 0, 170), -1)
+                    cv2.putText(annotated, f"SAFETY REVIEW: {violations} missing-PPE label(s)", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2)
+            except Exception as exc:
+                self.last_error = str(exc)
+                cv2.putText(annotated, "Detection error - check app logs", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-                preview = st.empty()
-                live_status = st.empty()
-                live_progress = st.progress(0)
-                live_person_count = 0
-                live_ppe_count = 0
-                live_max_persons_in_frame = 0
-                live_max_ppe_boxes_in_frame = 0
-                live_track_ids = set()
-                live_violation_history = defaultdict(lambda: deque(maxlen=5))
-                live_rows = []
-                recorded_live_incidents = set()
-                frame_number = 0
-                alert_history = []
-                last_sound_alert_at = 0.0
-                alert_active_last_frame = False
-                start_time = __import__("time").monotonic()
-                time_module = __import__("time")
+            return av.VideoFrame.from_ndarray(annotated, format="bgr24")
 
-                live_status.info(f"Monitoring for up to {duration_seconds} seconds...")
+    rtc_configuration = RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]})
+    webrtc_ctx = webrtc_streamer(
+        key="sentinel-browser-webcam",
+        video_processor_factory=BrowserPPEProcessor,
+        rtc_configuration=rtc_configuration,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
+    )
 
-                while time_module.monotonic() - start_time < duration_seconds:
-                    ok, frame = camera.read()
-                    if not ok:
-                        live_status.warning("No frame received. The stream may have disconnected.")
-                        break
-
-                    frame_number += 1
-                    height, width = frame.shape[:2]
-                    scale = min(1.0, live_width / max(width, 1))
-                    if scale < 1.0:
-                        frame = cv2.resize(frame, (int(width * scale), int(height * scale)))
-
-                    person_results = person_model.track(
-                        frame,
-                        persist=True,
-                        tracker="bytetrack.yaml",
-                        classes=[0],
-                        conf=live_confidence,
-                        verbose=False,
-                    )
-                    ppe_results = ppe_model.predict(
-                        frame,
-                        conf=live_confidence,
-                        verbose=False,
-                    )
-                    annotated = frame.copy()
-                    frame_has_violation = False
-                    persons_this_frame = 0
-                    ppe_boxes_this_frame = 0
-
-                    people_this_frame = []
-                    visible_track_ids = set()
-                    for result in person_results:
-                        if result.boxes is None:
-                            continue
-                        for box in result.boxes:
-                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                            track_id = None
-                            if box.id is not None and len(box.id) > 0:
-                                track_id = int(box.id[0].item())
-                                live_track_ids.add(track_id)
-                                visible_track_ids.add(track_id)
-                            people_this_frame.append({"box": (int(x1), int(y1), int(x2), int(y2)), "track_id": track_id, "violation": False})
-                            persons_this_frame += 1
-                            label = f"Worker ID {track_id}" if track_id is not None else "Worker (untracked)"
-                            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                            cv2.putText(annotated, label, (x1, max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-
-                    violating_track_ids = set()
-                    unassigned_violation = False
-                    for result in ppe_results:
-                        if result.boxes is None:
-                            continue
-                        names = result.names
-                        for box in result.boxes:
-                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                            class_id = int(box.cls[0].item())
-                            class_name = names.get(class_id, str(class_id))
-                            score = float(box.conf[0].item())
-                            live_ppe_count += 1
-                            ppe_boxes_this_frame += 1
-                            violation = is_missing_ppe(class_name)
-                            assigned_person = associate_ppe_to_person((x1, y1, x2, y2), people_this_frame)
-                            assigned_id = assigned_person["track_id"] if assigned_person else None
-                            if violation:
-                                frame_has_violation = True
-                                if assigned_person is not None:
-                                    assigned_person["violation"] = True
-                                    if assigned_id is not None:
-                                        violating_track_ids.add(assigned_id)
-                                else:
-                                    unassigned_violation = True
-                            box_color = (0, 0, 255) if violation else (0, 165, 255)
-                            cv2.rectangle(annotated, (x1, y1), (x2, y2), box_color, 3 if violation else 2)
-                            tag = f"{class_name} {score:.2f}"
-                            if assigned_id is not None:
-                                tag += f" | W{assigned_id}"
-                            cv2.putText(annotated, tag, (x1, max(25, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, box_color, 2)
-                            live_rows.append({
-                                "frame": frame_number,
-                                "elapsed_seconds": round(time_module.monotonic() - start_time, 2),
-                                "class": class_name,
-                                "confidence": round(score, 3),
-                                "associated_worker_id": assigned_id,
-                                "association_status": "heuristic match" if assigned_id is not None else "unassigned",
-                                "x1": int(x1), "y1": int(y1), "x2": int(x2), "y2": int(y2),
-                            })
-
-                    for tid in visible_track_ids:
-                        live_violation_history[tid].append(tid in violating_track_ids)
-                    confirmed_track_ids = {tid for tid in visible_track_ids if sum(live_violation_history[tid]) >= 3}
-                    for person in people_this_frame:
-                        x1, y1, x2, y2 = person["box"]
-                        tid = person["track_id"]
-                        if tid is not None and tid in confirmed_track_ids:
-                            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 4)
-                            cv2.putText(annotated, "PPE VIOLATION - REVIEW", (x1, min(annotated.shape[0]-8, y2+22)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
-
-                    # Store confirmed violations and a frame of visual evidence.
-                    for tid in confirmed_track_ids:
-                        classes_for_worker = [row["class"] for row in live_rows if row.get("associated_worker_id") == tid and is_missing_ppe(row.get("class", ""))]
-                        violation_name = ", ".join(sorted(set(classes_for_worker))) or "Missing PPE (repeated detection)"
-                        record_incident("Live: " + str(camera_type), tid, violation_name, None, annotated, recorded_live_incidents)
-                    if unassigned_violation:
-                        unassigned_classes = [row["class"] for row in live_rows[-max(1, ppe_boxes_this_frame):] if is_missing_ppe(row.get("class", "")) and row.get("associated_worker_id") is None]
-                        if unassigned_classes:
-                            record_incident("Live: " + str(camera_type), None, ", ".join(sorted(set(unassigned_classes))), None, annotated, recorded_live_incidents)
-
-                    live_max_persons_in_frame = max(live_max_persons_in_frame, persons_this_frame)
-                    live_max_ppe_boxes_in_frame = max(live_max_ppe_boxes_in_frame, ppe_boxes_this_frame)
-
-                    # Phase 5: prominent visual warning, red border and rate-limited audible alert.
-                    if frame_has_violation:
-                        alert_message = "⚠️ SAFETY ALERT — Missing-PPE label detected. Verify the worker and camera frame."
-                        live_status.error(alert_message)
-                        if not alert_active_last_frame:
-                            alert_history.append({
-                                "Time": datetime.now().astimezone().strftime("%H:%M:%S"),
-                                "Frame": frame_number,
-                                "Alert": "Missing-PPE label detected",
-                                "Review": "Human verification required",
-                            })
-                        alert_active_last_frame = True
-                        h, w = annotated.shape[:2]
-                        # Border blinks; warning text remains visible on every alert frame.
-                        if (frame_number // 3) % 2 == 0:
-                            cv2.rectangle(annotated, (4, 4), (w - 5, h - 5), (0, 0, 255), 10)
-                        cv2.rectangle(annotated, (0, 0), (w, min(52, h)), (0, 0, 180), -1)
-                        cv2.putText(annotated, "SAFETY ALERT: MISSING PPE - REVIEW", (12, 34),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-
-                        now_monotonic = time_module.monotonic()
-                        if enable_sound_alert and (now_monotonic - last_sound_alert_at >= alert_cooldown_seconds):
-                            # Browser audio can be blocked by autoplay policies; the visual alert still works.
-                            st.components.v1.html("""
-                                <div style="font-family:Arial,sans-serif;color:#b91c1c;font-weight:700;">
-                                  🔊 Safety alarm triggered
-                                </div>
-                                <script>
-                                  try {
-                                    const ctx = new (window.AudioContext || window.webkitAudioContext)();
-                                    const osc = ctx.createOscillator();
-                                    const gain = ctx.createGain();
-                                    osc.type = 'square'; osc.frequency.value = 880;
-                                    gain.gain.value = 0.12;
-                                    osc.connect(gain); gain.connect(ctx.destination);
-                                    osc.start();
-                                    setTimeout(() => { osc.stop(); ctx.close(); }, 350);
-                                  } catch (e) {}
-                                </script>
-                            """, height=38)
-                            last_sound_alert_at = now_monotonic
-                    else:
-                        alert_active_last_frame = False
-                        live_status.info(f"Monitoring for up to {duration_seconds} seconds...")
-
-                    # Streamlit image expects RGB, while OpenCV frames are BGR.
-                    preview.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
-                    elapsed = time_module.monotonic() - start_time
-                    live_progress.progress(min(elapsed / duration_seconds, 1.0))
-
-                if camera is not None:
-                    camera.release()
-                    camera = None
-                live_progress.progress(1.0)
-                live_status.success("Live monitoring session finished and camera released.")
-
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Unique Tracked IDs", len(live_track_ids))
-                m2.metric("Max People in One Frame", live_max_persons_in_frame)
-                m3.metric("Max PPE Boxes in One Frame", live_max_ppe_boxes_in_frame)
-                st.caption(
-                    "PPE-to-worker matching uses bounding-box geometry and can be wrong when workers overlap. IDs are temporary tracking IDs. Worker warning requires a missing-PPE label in at least 3 of the last 5 visible frames. Audible alerts may be blocked by browser autoplay settings; visual warnings remain active."
-                )
-                if alert_history:
-                    st.subheader("🚨 Real-Time Alert History")
-                    st.dataframe(pd.DataFrame(alert_history), use_container_width=True, hide_index=True)
-                    st.download_button(
-                        "⬇️ Download alert history (CSV)",
-                        data=pd.DataFrame(alert_history).to_csv(index=False).encode("utf-8"),
-                        file_name="sentinel_alert_history.csv",
-                        mime="text/csv",
-                    )
-                else:
-                    st.success("No missing-PPE alert was detected during this session.")
-                if any(is_missing_ppe(row.get("class", "")) for row in live_rows):
-                    st.markdown('<div class="sentinel-alert">⚠️ SAFETY ALERT — MISSING PPE CLASS DETECTED</div>', unsafe_allow_html=True)
-                    st.error("Review the red boxes and frames. Red worker boxes require repeated missing-PPE detections associated by bounding-box geometry; unmatched detections are frame-level alerts.")
-
-                if live_rows:
-                    live_df = pd.DataFrame(live_rows)
-                    st.subheader("🦺 Live PPE Detection Details")
-                    st.dataframe(live_df, use_container_width=True, hide_index=True)
-                    summary = live_df["class"].value_counts().rename_axis("Class").reset_index(name="Detection Count")
-                    st.subheader("📋 Live PPE Detection Summary")
-                    st.dataframe(summary, use_container_width=True, hide_index=True)
-                    st.download_button(
-                        "⬇️ Download Live Detection CSV",
-                        data=live_df.to_csv(index=False).encode("utf-8"),
-                        file_name="live_ppe_detection_results.csv",
-                        mime="text/csv",
-                    )
-                else:
-                    st.info("No PPE detections were recorded during this session. This does not prove workers lack PPE.")
-
-            except Exception as error:
-                st.error(f"Live monitoring failed: {error}")
-            finally:
-                if camera is not None:
-                    camera.release()
+    st.caption("Green boxes indicate person detections. PPE boxes are colored red when the model label explicitly indicates missing PPE; orange boxes indicate other PPE detections. These are AI-assisted detections, not proof of compliance. PPE-to-worker assignment is not confirmed in this browser preview.")
+    if webrtc_ctx.state.playing:
+        st.success("Browser webcam is active. If no video appears, check browser camera permissions and reload the page.")
+    else:
+        st.info("Click START above to begin browser webcam monitoring.")
 
 
 # =========================================================
