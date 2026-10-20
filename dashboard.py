@@ -876,13 +876,13 @@ elif page == "Live Webcam Monitoring":
                 cv2.putText(annotated, "Detection error - check app logs", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             return av.VideoFrame.from_ndarray(annotated, format="bgr24")
-rtc_configuration = RTCConfiguration({
-    "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-        {"urls": ["stun:stun1.l.google.com:19302"]},
-        {"urls": ["stun:stun2.l.google.com:19302"]}
-    ]
-})
+    rtc_configuration = RTCConfiguration({
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {"urls": ["stun:stun1.l.google.com:19302"]},
+            {"urls": ["stun:stun2.l.google.com:19302"]}
+        ]
+    })
     webrtc_ctx = webrtc_streamer(
         key="sentinel-browser-webcam",
         video_processor_factory=BrowserPPEProcessor,
